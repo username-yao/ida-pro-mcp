@@ -2,9 +2,7 @@ import json
 import threading
 import http.server
 from urllib.parse import urlparse
-from typing import Dict, Any, Callable, get_type_hints
-
-import idaapi
+from typing import Dict, Any, Callable, get_type_hints, TypedDict, Optional
 
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -143,7 +141,17 @@ class JSONRPCRequestHandler(http.server.BaseHTTPRequestHandler):
                 "data": str(e)
             }
 
-        response_body = json.dumps(response).encode("utf-8")
+        try:
+            response_body = json.dumps(response).encode("utf-8")
+        except Exception as e:
+            response_body = json.dumps({
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(e)
+                }
+            }).encode("utf-8")
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(response_body))
@@ -185,6 +193,7 @@ class Server:
             self.server.server_close()
         if self.server_thread:
             self.server_thread.join()
+            self.server = None
         print("[MCP] Server stopped")
 
     def _run_server(self):
@@ -203,18 +212,211 @@ class Server:
             print(f"[MCP] Server error: {e}")
         finally:
             self.running = False
-            self.server = None
+
+# A module that helps with writing thread safe ida code.
+# Based on:
+# https://web.archive.org/web/20160305190440/http://www.williballenthin.com/blog/2015/09/04/idapython-synchronization-decorator/
+import logging
+import queue
+import traceback
+import functools
+
+import ida_pro
+import ida_hexrays
+import ida_kernwin
+import ida_gdl
+import ida_lines
+import ida_idaapi
+import idc
+import idaapi
+import idautils
+import ida_nalt
+import ida_bytes
+import ida_typeinf
+
+class IDASyncError(Exception):
+    pass
+
+# Important note: Always make sure the return value from your function f is a
+# copy of the data you have gotten from IDA, and not the original data.
+#
+# Example:
+# --------
+#
+# Do this:
+#
+#   @idaread
+#   def ts_Functions():
+#       return list(idautils.Functions())
+#
+# Don't do this:
+#
+#   @idaread
+#   def ts_Functions():
+#       return idautils.Functions()
+#
+
+logger = logging.getLogger(__name__)
+
+# Enum for safety modes. Higher means safer:
+class IDASafety:
+    SAFE_NONE = 0
+    SAFE_READ = 1
+    SAFE_WRITE = 2
+
+
+call_stack = queue.LifoQueue()
+
+def sync_wrapper(ff, safety_mode: IDASafety):
+    """
+    Call a function ff with a specific IDA safety_mode.
+    """
+    #logger.debug('sync_wrapper: {}, {}'.format(ff.__name__, safety_mode))
+
+    if safety_mode not in [IDASafety.SAFE_READ, IDASafety.SAFE_WRITE]:
+        error_str = 'Invalid safety mode {} over function {}'\
+                .format(safety_mode, ff.__name__)
+        logger.error(error_str)
+        raise IDASyncError(error_str)
+
+    # No safety level is set up:
+    res_container = queue.Queue()
+
+    def runned():
+        #logger.debug('Inside runned')
+
+        # Make sure that we are not already inside a sync_wrapper:
+        if not call_stack.empty():
+            last_func_name = call_stack.get()
+            error_str = ('Call stack is not empty while calling the '
+                'function {} from {}').format(ff.__name__, last_func_name)
+            #logger.error(error_str)
+            raise IDASyncError(error_str)
+
+        call_stack.put((ff.__name__))
+        try:
+            res_container.put(ff())
+        except Exception:
+            traceback.print_exc()
+            res_container.put(None)
+        finally:
+            call_stack.get()
+            #logger.debug('Finished runned')
+
+    ret_val = idaapi.execute_sync(runned, safety_mode)
+    res = res_container.get()
+    return res
+
+def idawrite(f):
+    """
+    decorator for marking a function as modifying the IDB.
+    schedules a request to be made in the main IDA loop to avoid IDB corruption.
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        ff = functools.partial(f, *args, **kwargs)
+        ff.__name__ = f.__name__
+        return sync_wrapper(ff, idaapi.MFF_WRITE)
+    return wrapper
+
+def idaread(f):
+    """
+    decorator for marking a function as reading from the IDB.
+    schedules a request to be made in the main IDA loop to avoid
+      inconsistent results.
+    MFF_READ constant via: http://www.openrce.org/forums/posts/1827
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        ff = functools.partial(f, *args, **kwargs)
+        ff.__name__ = f.__name__
+        return sync_wrapper(ff, idaapi.MFF_READ)
+    return wrapper
+
+class Function(TypedDict):
+    start_address: int
+    end_address: int
+    name: str
+    prototype: str
+
+def get_function(address: int) -> Optional[Function]:
+    fn = idaapi.get_func(address)
+    if fn is None:
+        return None
+    # NOTE: You need IDA 9.0 SP1 or newer for this
+    prototype: ida_typeinf.tinfo_t = fn.get_prototype()
+    if prototype is not None:
+        prototype = str(prototype)
+    return {
+        "start_address": fn.start_ea,
+        "end_address": fn.end_ea,
+        "name": fn.name,
+        "prototype": prototype,
+    }
+
+@jsonrpc
+@idaread
+def get_function_by_name(name: str) -> Optional[Function]:
+    function_address = idaapi.get_name_ea(ida_pro.BADADDR, name)
+    if function_address == ida_pro.BADADDR:
+        return None
+    return get_function(function_address)
+
+@jsonrpc
+@idaread
+def get_function_by_address(address: int) -> Optional[Function]:
+    return get_function(address)
+
+@jsonrpc
+@idaread
+def get_current_address() -> int:
+    return idaapi.get_screen_ea()
+
+@jsonrpc
+@idaread
+def get_current_function() -> Optional[Function]:
+    return get_function(idaapi.get_screen_ea())
+
+@jsonrpc
+@idaread
+def list_functions() -> list[Function]:
+    return [get_function(address) for address in idautils.Functions()]
+
+class DecompilationResult(TypedDict):
+    error: str
+    pseudocode: str
+    called_functions: list[Function]
+
+@jsonrpc
+@idaread
+def decompile_function(address: int) -> DecompilationResult:
+    if not ida_hexrays.init_hexrays_plugin():
+        return {
+            "error": "Hex-Rays decompiler is not available",
+            "pseudocode": "",
+        }
+    error = ida_hexrays.hexrays_failure_t()
+    result: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(address, error, ida_hexrays.DECOMP_WARNINGS)
+    if not result:
+        return {
+            "error": f"decompilation failed at {error.errea}: {error.str}",
+            "pseudocode": "",
+        }
+    return {
+        "error": "",
+        "pseudocode": str(result),
+    }
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
     comment = "MCP Plugin"
     help = "MCP"
     wanted_name = "MCP"
-    wanted_hotkey = "Ctrl-Shift-M"
+    wanted_hotkey = "Ctrl-Alt-M"
 
     def init(self):
         self.server = Server()
-        print("[MCP] Plugin loaded, use Edit -> Plugins -> MCP (Ctrl+Shift+M) to start the server")
+        print("[MCP] Plugin loaded, use Edit -> Plugins -> MCP (Ctrl+Alt+M) to start the server")
         return idaapi.PLUGIN_KEEP
 
     def run(self, args):
