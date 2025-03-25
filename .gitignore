@@ -12,3 +12,13 @@ venv*/
 
 # Logs
 *.log
+
+# Test files
+*.idb
+*.i64
+*.nam
+*.id0
+*.id1
+*.id2
+*.til
+*.elf

@@ -1,4 +1,0 @@
-{
-  "run_command": "python test-standalone.py",
-  "execute_automatically": false
-}
