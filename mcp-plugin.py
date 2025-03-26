@@ -383,29 +383,122 @@ def list_functions() -> list[Function]:
     return [get_function(address) for address in idautils.Functions()]
 
 class DecompilationResult(TypedDict):
-    error: str
+    address: int
     pseudocode: str
-    called_functions: list[Function]
+    error: str
 
 @jsonrpc
 @idaread
 def decompile_function(address: int) -> DecompilationResult:
     if not ida_hexrays.init_hexrays_plugin():
         return {
-            "error": "Hex-Rays decompiler is not available",
+            "address": -1,
             "pseudocode": "",
+            "error": "Hex-Rays decompiler is not available",
         }
     error = ida_hexrays.hexrays_failure_t()
-    result: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(address, error, ida_hexrays.DECOMP_WARNINGS)
-    if not result:
+    cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(address, error, ida_hexrays.DECOMP_WARNINGS)
+    if not cfunc:
         return {
-            "error": f"decompilation failed at {error.errea}: {error.str}",
+            "address": address,
             "pseudocode": "",
+            "error": f"decompilation failed at {error.errea}: {error.str}",
         }
     return {
+        "address": cfunc.entry_ea,
+        "pseudocode": str(cfunc),
         "error": "",
-        "pseudocode": str(result),
     }
+
+@jsonrpc
+@idaread
+def show_decompilation(address: int):
+    ida_hexrays.open_pseudocode(address, ida_hexrays.OPF_REUSE)
+
+@jsonrpc
+@idaread
+def show_disassembly(address: int):
+    ida_hexrays.jumpto(address)
+
+def refresh_decompiler_widget():
+    widget = ida_kernwin.get_current_widget()
+    if widget is not None:
+        vu = ida_hexrays.get_widget_vdui(widget)
+        if vu is not None:
+            vu.refresh_ctext()
+
+def refresh_decompiler_ctext(function_address: int):
+    error = ida_hexrays.hexrays_failure_t()
+    cfunc: ida_hexrays.cfunc_t = ida_hexrays.decompile_func(function_address, error, ida_hexrays.DECOMP_WARNINGS)
+    if cfunc:
+        cfunc.refresh_func_ctext()
+
+@jsonrpc
+@idawrite
+def rename_local_variable(function_address: int, old_name: str, new_name: str) -> bool:
+    if not ida_hexrays.rename_lvar(function_address, old_name, new_name):
+        return False
+    refresh_decompiler_ctext(function_address)
+    return True
+
+@jsonrpc
+@idawrite
+def rename_function(function_address: int, new_name: str) -> bool:
+    fn = idaapi.get_func(function_address)
+    if not fn:
+        return False
+    result = idaapi.set_name(fn.start_ea, new_name)
+    refresh_decompiler_ctext(fn.start_ea)
+    return result
+
+@jsonrpc
+@idawrite
+def set_function_prototype(function_address: int, prototype: str) -> str:
+    fn = idaapi.get_func(function_address)
+    if not fn:
+        return "error: function not found"
+    try:
+        tif = ida_typeinf.tinfo_t(prototype, None, ida_typeinf.PT_SIL)
+        if not tif.is_func():
+            return "error: parsed declaration is not a function type"
+        if not ida_typeinf.apply_tinfo(fn.start_ea, tif, ida_typeinf.PT_SIL):
+            return "error: failed to apply type"
+        refresh_decompiler_ctext(fn.start_ea)
+        return "success"
+    except Exception as e:
+        return f"error: failed to parse prototype string: {prototype}"
+
+class my_modifier_t(ida_hexrays.user_lvar_modifier_t):
+    def __init__(self, var_name: str, new_type: ida_typeinf.tinfo_t):
+        ida_hexrays.user_lvar_modifier_t.__init__(self)
+        self.var_name = var_name
+        self.new_type = new_type
+
+    def modify_lvars(self, lvars):
+        for idx, lvar_saved in enumerate(lvars.lvvec):
+            lvar_saved: ida_hexrays.lvar_saved_info_t
+            if lvar_saved.name == self.var_name:
+                lvar_saved.type = self.new_type
+                return True
+        return False
+
+@jsonrpc
+@idawrite
+def set_local_variable_type(function_address: int, variable_name: str, new_type: str) -> str:
+    try:
+        new_tif = ida_typeinf.tinfo_t(new_type, None, ida_typeinf.PT_SIL)
+    except Exception as e:
+        return f"error: failed to parse type: {new_type}"
+    fn = idaapi.get_func(function_address)
+    if not fn:
+        return "error: function not found"
+    if not ida_hexrays.rename_lvar(fn.start_ea, variable_name, variable_name):
+        return f"error: failed to find local variable: {variable_name}"
+    modifier = my_modifier_t(variable_name, new_tif)
+    if not ida_hexrays.modify_user_lvars(fn.start_ea, modifier):
+        return f"error: failed to modify local variable: {variable_name}"
+    refresh_decompiler_ctext(fn.start_ea)
+    return "success"
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
