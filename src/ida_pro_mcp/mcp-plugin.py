@@ -815,7 +815,7 @@ def list_local_types():
                 else:
                     simple_decl = tif._print(None, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI)
                     if simple_decl:
-                        locals.append(f"  Simple declaration:\n{simple_decl}")  
+                        locals.append(f"  Simple declaration:\n{simple_decl}")
             else:
                 message = f"\nType #{ordinal}: Failed to retrieve information."
                 if error.str:
@@ -1010,6 +1010,112 @@ def disassemble_function(
         disassembly_function.update(arguments=arguments)
 
     return disassembly_function
+
+
+# 新增功能 ---------------------------------------------------------------------------
+
+class DisassemblyRange(TypedDict):
+    """包含指定范围反汇编结果"""
+    start_ea: str
+    end_ea: str
+    lines: list[DisassemblyLine]
+
+
+@jsonrpc
+@idaread
+def disassemble_range(
+    start_address: Annotated[str, "Start address to disassemble"],
+    size: Annotated[int, "Number of bytes to disassemble"],
+) -> DisassemblyRange:
+    """Get assembly code for an arbitrary range [start, start+size)."""
+    start = parse_address(start_address)
+    end = start + size
+
+    if is_window_active():
+        ida_kernwin.jumpto(start)
+
+    lines: list[DisassemblyLine] = []
+    ea = start
+    while ea < end:
+        seg = idaapi.getseg(ea)
+        if seg is None:
+            # not mapped; skip to next address inside the requested range
+            ea += 1
+            continue
+
+        # Generate disassembly line similar to disassemble_function()
+        label = idc.get_name(ea, 0)
+        if label == "":
+            label = None
+
+        comments: list[str] = []
+        if comment := idaapi.get_cmt(ea, False):
+            comments += [comment]
+        if comment := idaapi.get_cmt(ea, True):
+            comments += [comment]
+
+        raw_instruction = idaapi.generate_disasm_line(ea, 0)
+        tls = ida_kernwin.tagged_line_sections_t()
+        ida_kernwin.parse_tagged_line_sections(tls, raw_instruction)
+        insn_section = tls.first(ida_lines.COLOR_INSN)
+
+        operands = []
+        for op_tag in range(ida_lines.COLOR_OPND1, ida_lines.COLOR_OPND8 + 1):
+            op_n = tls.first(op_tag)
+            if not op_n:
+                break
+            op: str = op_n.substr(raw_instruction)
+            operands.append(ida_lines.tag_remove(op))
+
+        mnem = ida_lines.tag_remove(insn_section.substr(raw_instruction)) if insn_section else ""
+        instruction = f"{mnem} {', '.join(operands)}".strip()
+
+        line: DisassemblyLine = DisassemblyLine(
+            address=f"{ea:#x}",
+            instruction=instruction,
+        )
+        if seg:
+            line.update(segment=idaapi.get_segm_name(seg))
+        if label:
+            line.update(label=label)
+        if comments:
+            line.update(comments=comments)
+
+        lines.append(line)
+
+        # Advance to next instruction/item
+        item_size = idaapi.get_item_size(ea)
+        if item_size == 0:
+            # Avoid infinite loop if IDA cannot determine size
+            ea += 1
+        else:
+            ea += item_size
+
+    return DisassemblyRange(start_ea=f"{start:#x}", end_ea=f"{end:#x}", lines=lines)
+
+
+@jsonrpc
+@idaread
+def get_function_callees(
+    function_address: Annotated[str, "Address of the function to analyze"],
+) -> list[Function]:
+    """Return list of functions that the given function calls (callees)."""
+    start = parse_address(function_address)
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found containing address {function_address}")
+
+    callees: set[int] = set()
+    for ea in idautils.FuncItems(func.start_ea):
+        # Ensure current item is code
+        if not ida_bytes.is_code(ida_bytes.get_full_flags(ea)):
+            continue
+        for cref in idautils.CodeRefsFrom(ea, 0):
+            callee_func = idaapi.get_func(cref)
+            if callee_func:
+                callees.add(callee_func.start_ea)
+
+    return [get_function(addr, raise_error=False) for addr in sorted(callees)]
 
 class Xref(TypedDict):
     address: str
