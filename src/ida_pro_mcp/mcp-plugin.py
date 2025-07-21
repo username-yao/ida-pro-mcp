@@ -1027,7 +1027,7 @@ def disassemble_range(
     start_address: Annotated[str, "Start address to disassemble"],
     size: Annotated[int, "Number of bytes to disassemble"],
 ) -> DisassemblyRange:
-    """Get assembly code for an arbitrary range [start, start+size)."""
+    """Get disassembly and data for an arbitrary range [start, start+size)."""
     start = parse_address(start_address)
     end = start + size
 
@@ -1054,21 +1054,8 @@ def disassemble_range(
         if comment := idaapi.get_cmt(ea, True):
             comments += [comment]
 
-        raw_instruction = idaapi.generate_disasm_line(ea, 0)
-        tls = ida_kernwin.tagged_line_sections_t()
-        ida_kernwin.parse_tagged_line_sections(tls, raw_instruction)
-        insn_section = tls.first(ida_lines.COLOR_INSN)
-
-        operands = []
-        for op_tag in range(ida_lines.COLOR_OPND1, ida_lines.COLOR_OPND8 + 1):
-            op_n = tls.first(op_tag)
-            if not op_n:
-                break
-            op: str = op_n.substr(raw_instruction)
-            operands.append(ida_lines.tag_remove(op))
-
-        mnem = ida_lines.tag_remove(insn_section.substr(raw_instruction)) if insn_section else ""
-        instruction = f"{mnem} {', '.join(operands)}".strip()
+        raw_line = idaapi.generate_disasm_line(ea, 0)
+        instruction = ida_lines.tag_remove(raw_line).strip() if raw_line else "???"
 
         line: DisassemblyLine = DisassemblyLine(
             address=f"{ea:#x}",
@@ -1951,6 +1938,19 @@ def dbg_enable_breakpoint(
     if idaapi.enable_bpt(ea, enable):
         return f"Breakpoint {'enabled' if enable else 'disabled'} at {hex(ea)}"
     return f"Failed to {'' if enable else 'disable '}breakpoint at address {hex(ea)}"
+
+@jsonrpc
+@idaread
+def get_hex_dump(
+    address: Annotated[str, "Address to start reading from"],
+    size: Annotated[int, "Number of bytes to read"],
+) -> str:
+    """Reads a range of bytes from the database and returns a hex string."""
+    start = parse_address(address)
+    data = ida_bytes.get_bytes(start, size)
+    if data is None:
+        raise IDAError(f"Failed to read bytes at {address} (invalid start address).")
+    return data.hex()
 
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
