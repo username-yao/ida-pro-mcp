@@ -1952,6 +1952,39 @@ def get_hex_dump(
         raise IDAError(f"Failed to read bytes at {address} (invalid start address).")
     return data.hex()
 
+@jsonrpc
+@idaread
+def get_function_strings(
+    function_address: Annotated[str, "Address of the function to analyze"],
+) -> list[str]:
+    """Return list of unique string literals referenced by the given function."""
+
+    start = parse_address(function_address)
+    func = idaapi.get_func(start)
+    if not func:
+        raise IDAError(f"No function found containing address {function_address}")
+
+    # Build a lookup table of all strings in the binary for quick membership checks
+    string_map: dict[int, str] = {}
+    for s in idautils.Strings():
+        try:
+            string_map[s.ea] = str(s)
+        except Exception:
+            # Skip malformed strings
+            continue
+
+    strings_set: set[str] = set()
+
+    # Iterate over all items (instructions/data) within the function body
+    for ea in idautils.FuncItems(func.start_ea):
+        # Collect direct data references originating from each item
+        for ref in idautils.DataRefsFrom(ea):
+            if ref in string_map:
+                strings_set.add(string_map[ref])
+
+    # Return the strings as a sorted list for deterministic output
+    return sorted(strings_set)
+
 class MCP(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
     comment = "MCP Plugin"
